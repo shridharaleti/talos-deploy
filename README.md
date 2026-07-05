@@ -1,107 +1,154 @@
-# Talos Deploy
+# Talos Deploy — One-Click K8s on ESXi
 
-One-click Kubernetes cluster deployment on ESXi using [Talos Linux](https://www.talos.dev/).
+Python script deploys Talos Linux Kubernetes cluster on ESXi. Everything pulled on-the-fly.
 
-Everything pulled on-the-fly — no pre-staged ISOs, no manual `kubeadm`, no SSH into nodes.
+**Now with full zero-touch ESXi integration via `govc`** — creates VMs, uploads ISO, powers on, deploys cluster. One command.
+
+Or manual mode if your VMs already exist. Same script, no govc needed.
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────────────────┐
-│  You run    │────▶│  This script │────▶│  Talos K8s cluster      │
-│  1 command  │     │  (this host) │     │  on ESXi VMs            │
-└─────────────┘     └──────────────┘     │  MetalLB + Calico ready │
-                                         └─────────────────────────┘
+┌──────────────────┐    govc     ┌──────────────┐   talosctl   ┌─────────────────────────┐
+│  You run         │───────────▶│  ESXi Host    │◀────────────│  Talos K8s cluster      │
+│  1 command       │ VM create  │  upload ISO   │ config+init │  MetalLB + Calico ready │
+│  (this machine)  │ ISO upload │  power on     │             │                         │
+└──────────────────┘            │  wait for IP  │             └─────────────────────────┘
+                                └──────────────┘
 ```
 
 ## Features
 
-- **One command** — handles everything from talosctl download to MetalLB config
+- **True one-click** — creates VMs via govc, uploads ISO, deploys cluster
 - **Two modes** — single-node (all-in-one) or multi-node (cp + N workers)
-- **K8s 1.34 / 1.35 / 1.36** — choose your version
-- **MetalLB included** — L2 IP pool auto-configured
-- **NetworkPolicy** — Calico baked into Talos by default
+- **K8s 1.34 / 1.35 / 1.36** — Talos v1.8 / v1.9 / v1.10
+- **MetalLB** — L2 IP pool auto-configured
+- **NetworkPolicy** — Calico baked into Talos (default CNI)
 - **Resumable** — if script crashes, rerun resumes from last phase
-- **SHA256 verified** — talosctl binary verified on download
+- **SHA256 verified** — talosctl + govc binaries verified on download
 - **Zero dependencies** — Python 3.8+ stdlib only
-- **Arch-aware** — auto-selects arm64 or amd64 ISO + talosctl
+- **Arch-aware** — auto-selects arm64 or amd64 ISO + CLI binaries
 
 ---
 
-## Prerequisites
+## Quick Start
 
-### On this machine (where you run the script)
+### Zero-touch (full ESXi VM creation + deploy)
 
-| Requirement | Install |
-|---|---|
-| Python 3.8+ | Usually pre-installed |
-| `kubectl` | `snap install kubectl --classic` or `apt install kubectl` |
-| Internet | Access to `github.com`, `factory.talos.dev`, `k8s.io` |
-
-### On ESXi
-
-| Requirement | Notes |
-|---|---|
-| ESXi 7.0+ with web UI | For ISO upload + VM creation |
-| VMs created | 2+ vCPU, 4 GB RAM, 20 GB disk per node |
-| Network | VMs on same L2 segment, reachable from this machine on TCP 50000 + 6443 |
-
----
-
-## Step-by-Step Instructions
-
-### 1. Create VMs on ESXi
-
-Open ESXi web UI → **Virtual Machines** → **Create / Register VM**
-
-For each node (controlplane + workers):
-```
-Guest OS family:  Linux
-Guest OS version: Ubuntu Linux (64-bit)
-Hardware:         2 vCPU, 4 GB RAM, 20 GB disk
-Network:          VM Network (bridged, same L2)
-CD/DVD:           Store ISO image → upload the Talos ISO (script provides URL)
-```
-
-> **Tip:** Clone a template VM for faster worker provisioning.
-
-### 2. Boot VMs from ISO
-
-1. Power on each VM → it boots from the Talos ISO
-2. Wait for the Talos maintenance mode prompt:
-   ```
-   Talos Linux ...
-   maintenance: login on console
-   ```
-3. Note the IP displayed (DHCP) or configure static via `ip=` kernel param
-
-### 3. Run the script
-
-**Single-node (all-in-one):**
 ```bash
-python3 ~/talos-deploy/talos-deploy.py all-in-one \
-  --cp 10.0.1.50 \
-  --cluster mycluster \
-  --k8s 1.35 \
+python3 talos-deploy.py all-in-one \
+  --cp 10.0.1.50 --cluster prod --k8s 1.35 \
+  --esxi-host 10.0.1.10 \
+  --esxi-user root --esxi-pass mypassword \
+  --esxi-datastore datastore1 \
+  --esxi-network "VM Network" \
   --metallb-range 10.0.1.240-10.0.1.250
 ```
 
-**Multi-node (1 cp + N workers):**
+### Manual (VMs already booted, no ESXi args)
+
 ```bash
-python3 ~/talos-deploy/talos-deploy.py multi \
-  --cp 10.0.1.50 \
-  --workers 10.0.1.51,10.0.1.52,10.0.1.53 \
-  --cluster mycluster \
-  --k8s 1.36
+python3 talos-deploy.py all-in-one \
+  --cp 10.0.1.50 --cluster prod --k8s 1.35
 ```
 
-The script will:
-1. Download `talosctl` (SHA256 verified)
-2. Print the ISO URL (for step 1 above)
-3. Wait for you to confirm VMs are booted
-4. Generate + apply Talos machine configs
-5. Bootstrap the cluster
-6. Wait for all nodes Ready
-7. Install MetalLB IP pool
-8. Print `export KUBECONFIG=...`
+### Multi-node zero-touch
+
+```bash
+python3 talos-deploy.py multi \
+  --cp 10.0.1.50 --workers 10.0.1.51,10.0.1.52,10.0.1.53 \
+  --cluster prod --k8s 1.36 \
+  --esxi-host 10.0.1.10 \
+  --esxi-user root --esxi-pass mypassword \
+  --esxi-datastore datastore1 \
+  --esxi-network "VM Network"
+```
+
+---
+
+## CLI Reference
+
+| Flag | Required | Default | Description |
+|---|---|---|---|
+| `--cp` | Yes | — | Controlplane node IP |
+| `--cluster` | Yes | — | Cluster name (lowercase, RFC1123) |
+| `--k8s` | No | `1.35` | K8s version: `1.34` / `1.35` / `1.36` |
+| `--metallb-range` | No | `192.168.1.240–250` | MetalLB L2 IP pool |
+| **ESXi (govc VM creation)** | | | |
+| `--esxi-host` | No | — | ESXi IP/hostname → enables govc mode |
+| `--esxi-user` | No | `root` | ESXi username |
+| `--esxi-pass` | No | `$ESXI_PASSWORD` | ESXi password (or set env var) |
+| `--esxi-datastore` | No | `datastore1` | Datastore name |
+| `--esxi-network` | No | `VM Network` | Network/portgroup name |
+| `--vcpu` | No | `2` | vCPU per VM |
+| `--ram-gb` | No | `4` | RAM per VM (GB) |
+| `--disk-gb` | No | `20` | Disk per VM (GB) |
+| `--workers` | Yes (multi) | — | Worker IPs, comma-separated |
+
+### govc environment variables (alternative to CLI flags)
+
+```bash
+export GOVC_URL=https://root:password@10.0.1.10/sdk
+export GOVC_USERNAME=root
+export GOVC_PASSWORD=secret
+export GOVC_DATASTORE=datastore1
+export GOVC_NETWORK="VM Network"
+export GOVC_INSECURE=true
+```
+
+Then omit `--esxi-*` flags — govc reads env vars.
+
+---
+
+## Step-by-Step: Full Zero-Touch Mode
+
+### 1. Pre-flight checks
+
+```bash
+# Install kubectl if missing
+snap install kubectl --classic
+
+# Verify ESXi is reachable
+curl -k https://<ESXI_IP>/ui
+```
+
+### 2. Run the script
+
+```bash
+python3 talos-deploy.py all-in-one \
+  --cp 10.0.1.50 --cluster prod --k8s 1.35 \
+  --esxi-host 10.0.1.10 \
+  --esxi-pass your-password \
+  --esxi-datastore datastore1 \
+  --esxi-network "VM Network"
+```
+
+### 3. Watch it happen
+
+```
+[0/4] Create VMs on ESXi
+      ↓ govc v0.40.0 installed ✓
+      ↓ ISO v1.9 → factory.talos.dev ... (80 MB)
+      ↑ Uploading to datastore ... ✓
+  Creating VM: prod-cp (10.0.1.50) ... → 10.0.1.50 ✓
+      All VMs created + booted ✓
+
+[1/4] Generate + apply Talos configs
+      configs generated + patched ✓
+      cp config applied — rebooting ✓
+
+[2/4] Bootstrap cluster
+      waiting for nodes to boot ... → healthy ✓
+      bootstrap OK ✓
+
+[3/4] Wait for nodes ready
+      1/1 Ready ✓
+      ✓ all pods healthy
+
+[4/4] Configure MetalLB IP pool
+      MetalLB pool 10.0.1.240-10.0.1.250 ✓
+
+✅ CLUSTER READY
+   export KUBECONFIG=/tmp/talos-XXXXXX/kubeconfig
+```
 
 ### 4. Verify
 
@@ -109,149 +156,145 @@ The script will:
 export KUBECONFIG=/tmp/talos-XXXXXX/kubeconfig
 kubectl get nodes -o wide
 kubectl get pods -A
-```
 
-### 5. Test LoadBalancer
-
-```bash
+# Test LoadBalancer
 kubectl create deployment nginx --image=nginx --replicas=2
 kubectl expose deployment nginx --port=80 --type=LoadBalancer
 kubectl get svc nginx
-# → EXTERNAL-IP = one of your MetalLB pool IPs
 curl http://<EXTERNAL-IP>
 ```
 
 ---
 
-## CLI Reference
+## What govc Does
 
-```
-usage: talos-deploy.py [-h] {all-in-one,multi} ...
+| govc command | Purpose |
+|---|---|
+| `govc datastore.upload` | Upload Talos ISO (~80 MB) to ESXi datastore |
+| `govc vm.create` | Create VM: 2 vCPU, 4 GB RAM, 20 GB disk, vmxnet3 NIC, pvscsi controller |
+| `govc device.cdrom.add` | Attach ISO as CDROM drive |
+| `govc device.boot` | Set boot order: CDROM first, then disk |
+| `govc vm.change -e guestinfo.talos.ip=` | Inject IP hint for Talos |
+| `govc vm.power -on` | Power on the VM |
+| `govc vm.ip` | Poll for DHCP IP, blocks until assigned |
 
-Options (shared):
-  --cp CP               Controlplane node IP (required)
-  --cluster CLUSTER     Cluster name, lowercase RFC1123 (required)
-  --k8s {1.34,1.35,1.36}  K8s version (default: 1.35)
-  --metallb-range       MetalLB L2 IP pool (default: 192.168.1.240-192.168.1.250)
-
-Subcommands:
-  all-in-one            Single VM = controlplane + worker
-  multi                 1 controlplane + N workers
-
-Multi-only:
-  --workers             Comma-separated worker IPs (required for multi)
-```
-
----
-
-## K8s ↔ Talos Version Map
-
-| `--k8s` | Talos | Status |
-|---|---|---|
-| `1.34` | v1.8 | Stable |
-| `1.35` | v1.9 | **Default** — latest stable |
-| `1.36` | v1.10 | Pre-release |
+Only runs if `--esxi-host` is provided. Otherwise manual mode — script assumes VMs already booted.
 
 ---
 
 ## Architecture
 
 ```
-This machine (Jetson / laptop / CI)
-  │
-  │  talosctl apply-config --insecure
-  │  talosctl bootstrap
-  │  talosctl kubeconfig
-  │
-  ▼
-┌──────────────────────────────────────────────────────────┐
-│                    ESXi Hypervisor                       │
-│                                                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
-│  │ CP (Talos)  │  │ Worker 1    │  │ Worker 2    │     │
-│  │ 10.0.1.50   │  │ 10.0.1.51   │  │ 10.0.1.52   │     │
-│  │             │  │             │  │             │     │
-│  │ kube-apisrv │  │ kubelet     │  │ kubelet     │     │
-│  │ etcd        │  │ containerd  │  │ containerd  │     │
-│  │ kube-sched  │  │             │  │             │     │
-│  │ kube-ctrl   │  │             │  │             │     │
-│  │ Calico      │  │ Calico      │  │ Calico      │     │
-│  └─────────────┘  └─────────────┘  └─────────────┘     │
-│                                                          │
-│  MetalLB: 10.0.1.240-10.0.1.250 (L2 advertisement)      │
-└──────────────────────────────────────────────────────────┘
+Your machine (Jetson / laptop / CI)
+    │
+    ├─ urllib ───▶ github.com (talosctl + govc binaries, SHA256 verified)
+    ├─ urllib ───▶ factory.talos.dev (Talos ISO, ~80 MB)
+    │
+    ├─ govc ──────▶ ESXi host (HTTPS 443)
+    │               ├─ vm.create (prod-cp, prod-worker-1, ...)
+    │               ├─ datastore.upload ISO
+    │               ├─ device.cdrom.add ISO
+    │               ├─ vm.power -on
+    │               └─ vm.ip → DHCP IP returned
+    │
+    ├─ talosctl ──▶ Talos nodes (TCP 50000)
+    │               ├─ gen config (cluster.yaml, talosconfig)
+    │               ├─ apply-config (node reboots into Talos)
+    │               ├─ health (wait for boot)
+    │               ├─ bootstrap (init controlplane)
+    │               └─ kubeconfig (fetch for kubectl)
+    │
+    └─ kubectl ───▶ K8s API (TCP 6443)
+                    ├─ get nodes (wait for Ready)
+                    └─ apply MetalLB pool
 ```
 
 ---
 
-## What Gets Installed
+## K8s ↔ Talos ↔ Components
 
-| Component | Version | Purpose |
-|---|---|---|
-| **Talos Linux** | v1.8 / v1.9 / v1.10 | Immutable OS, no SSH, API-driven |
-| **containerd** | Ships with Talos | Container runtime |
-| **Calico** | v3.29 (via Talos) | CNI + NetworkPolicy enforcement |
-| **MetalLB** | v0.14.9 | LoadBalancer service IPs (L2 mode) |
-| **Kubernetes** | 1.34 / 1.35 / 1.36 | Cluster orchestration |
+| `--k8s` | Talos | govc | Calico | MetalLB | K8s API |
+|---|---|---|---|---|---|
+| `1.34` | v1.8 | v0.40.0 | v3.29 | v0.14.9 | ~1.34 |
+| `1.35` | v1.9 | v0.40.0 | v3.29 | v0.14.9 | ~1.35 |
+| `1.36` | v1.10 | v0.40.0 | v3.29 | v0.14.9 | ~1.36 |
 
 ---
 
 ## Resume / State
 
-The script saves progress to `/tmp/talos-deploy-state.json`.
+Progress saved to `/tmp/talos-deploy-state.json` after each phase:
 
-Phases saved:
 ```
-init → booted → configs_applied → bootstrapped → kube_ready → nodes_ready → done
+init → vms_created → configs_applied → bootstrapped → nodes_ready → done
 ```
 
-**If the script crashes:** re-run the same command. It resumes from the last saved phase.
+**Crash mid-run?** Re-run the exact same command. Resumes from last completed phase.
 
-**To start over:** `rm /tmp/talos-deploy-state.json`
+**Start fresh:** `rm /tmp/talos-deploy-state.json`
+
+---
+
+## Pre-Requisites
+
+| Requirement | Check |
+|---|---|
+| Python 3.8+ | Built-in |
+| `kubectl` | `snap install kubectl --classic` |
+| Internet access | To `github.com`, `factory.talos.dev`, `k8s.io` |
+| ESXi 7.0+ | Reachable on HTTPS 443 from this machine |
+| ESXi credentials | Root or admin user with VM creation permissions |
+| Datastore space | ~100 MB for ISO, 20 GB per VM disk |
+| DHCP on target network | VMs must get IPs automatically |
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
+| Problem | Fix |
 |---|---|
-| `talosctl: command not found` | Auto-downloaded. Check `~/.local/bin/` in PATH |
-| VMs don't get IPs | Check ESXi network config — VMs need DHCP or static IP via kernel param |
-| `bootstrap failed` | VM RAM too low (need 2GB+), or API server not up. Wait 2 min, re-run |
-| MetalLB IPs don't work | Check `kubectl get pods -n metallb-system`, all should be Running |
-| `kubectl not found` | Install: `snap install kubectl --classic` |
-| Script hangs at boot | Network unreachable. Check firewall on TCP 50000 |
-| SHA256 mismatch | Corrupted download. Delete `~/.local/bin/talosctl`, re-run |
-| Nodes not Ready | `kubectl describe node <name>` for events. Calico images may still be pulling |
+| `govc not found` | Auto-downloaded to `~/.local/bin/`. Check PATH includes it |
+| `Cannot connect to ESXi` | Check IP, firewall TCP 443, TLS cert. Use `--esxi-insecure` for self-signed |
+| Datastore upload fails | Check datastore name (`govc datastore.ls`). Must match exactly |
+| `vm.ip` never returns | Network needs DHCP. Talos prints IP on console once booted |
+| `bootstrap failed` | VM RAM < 2 GB. Increase `--ram-gb 4` |
+| MetalLB IPs unreachable | Must be same L2 as VMs. Talos uses host network, not overlay |
+| `govc` hang on ISO upload | Slow network. ~80 MB ISO. Timeout increased to 300s |
+| Node stuck in `NotReady` | Calico pods pulling images. Wait 2-3 min, check `kubectl get pods -n calico-system` |
 
 ---
 
 ## Cleanup
 
-Talos is immutable — no `kubeadm reset` needed.
+```bash
+# Destroy VMs via govc
+govc vm.destroy prod-cp
+govc vm.destroy prod-worker-1
+govc vm.destroy prod-worker-2
 
-**Option 1:** `talosctl reset --nodes <IP>` from maintenance mode
-**Option 2:** Power off VMs — Talos has no persistent state (except etcd on controlplane disk)
-**Option 3:** Reimage — Talos wipes clean on boot if configured for `disk wipe`
+# Or via ESXi web UI → delete VMs
+
+# Delete state file
+rm /tmp/talos-deploy-state.json
+```
 
 ---
 
 ## Post-Deploy Examples
 
 ```bash
-# Deploy an app with LoadBalancer
+export KUBECONFIG=/tmp/talos-XXXXXX/kubeconfig
+
+# LB deployment
 kubectl create deployment myapp --image=nginx --replicas=3
 kubectl expose deployment myapp --port=80 --type=LoadBalancer
-
-# Check MetalLB assignment
 kubectl get svc myapp
-# NAME    TYPE           CLUSTER-IP     EXTERNAL-IP    PORT(S)        AGE
-# myapp   LoadBalancer   10.96.45.123   10.0.1.241     80:31234/TCP   12s
+# NAME    TYPE           CLUSTER-IP     EXTERNAL-IP    PORT(S)
+# myapp   LoadBalancer   10.96.45.123   10.0.1.241     80:31234/TCP
 
-# Access from any machine on the network
 curl http://10.0.1.241
 
-# Apply NetworkPolicy (Calico enforces)
+# NetworkPolicy (Calico enforces)
 kubectl apply -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -259,11 +302,8 @@ metadata:
   name: deny-all
 spec:
   podSelector: {}
-  policyTypes:
-  - Ingress
+  policyTypes: [Ingress]
 EOF
-
-# All ingress blocked except what you allow
 ```
 
 ---

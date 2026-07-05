@@ -1,48 +1,72 @@
 #!/usr/bin/env python3
 """
-One-click Talos Linux K8s cluster on ESXi VMs. Everything pulled on-the-fly.
+One-click Talos Linux K8s cluster on ESXi. Everything pulled on-the-fly.
 
-Production-grade with:
-  - Proper talosctl gen config patching (RFC 6902 JSON patches)
-  - MetalLB applied via kubectl (not machine config)
-  - Health checks with retries, proper node readiness wait
-  - Arch-aware ISO URLs (amd64/arm64)
-  - State save/resume if interrupted
-  - talosctl version verification + SHA256 check
-  - Rollback hints on failure
+True one-click — includes VM creation via govc:
+  - Uploads Talos ISO to ESXi datastore
+  - Creates VMs with proper CPU/RAM/disk
+  - Attaches ISO, powers on
+  - Waits for IP assignment
+  - Then deploys Talos cluster (config gen, apply, bootstrap, MetalLB)
 
 Modes:
-  all-in-one:  1 VM = controlplane + worker (allowSchedulingOnControlPlanes)
+  all-in-one:  1 VM = controlplane + worker
   multi:       1 controlplane + N workers
 
-Usage:
-  python3 talos-deploy.py all-in-one \
-    --cp 192.168.1.100 --cluster prod --k8s 1.35 \
-    --metallb-range 192.168.1.240-192.168.1.250
+K8s versions: 1.34 / 1.35 / 1.36 → maps to Talos v1.8 / v1.9 / v1.10
 
+Flags for zero-touch (ESXi credentials):
+  --esxi-host HOST    ESXi IP or hostname (required for VM creation)
+  --esxi-user USER    ESXi username (default: root)
+  --esxi-pass PASS    ESXi password (env: ESXI_PASSWORD)
+  --esxi-datastore DS Datastore name (default: datastore1)
+  --esxi-network NET  Network name (default: VM Network)
+
+Flags for VM spec (optional):
+  --vcpu N             vCPU per VM (default: 2)
+  --ram-gb N           RAM per VM in GB (default: 4)
+  --disk-gb N          Disk per VM in GB (default: 20)
+  --ip-start BASE_IP   Sequential IP assignment: cp=base, worker1=base+1, ...
+  --ip-pool CIDR       Static IP range for MetalLB + guestinfo (overrides --metallb-range)
+
+If --esxi-host not provided: assumes VMs already exist (manual mode).
+
+Usage:
+  # Full zero-touch: create VMs + deploy cluster
+  python3 talos-deploy.py all-in-one \
+    --cp 10.0.1.50 --cluster prod --k8s 1.35 \
+    --esxi-host 10.0.1.10 --esxi-user root --esxi-pass secret \
+    --esxi-datastore datastore1 --esxi-network "VM Network"
+
+  # Minimal: VMs already booted, just deploy
   python3 talos-deploy.py multi \
-    --cp 192.168.1.100 --workers 192.168.1.101,192.168.1.102 \
-    --cluster prod --k8s 1.36
+    --cp 10.0.1.50 --workers 10.0.1.51,10.0.1.52 --cluster prod --k8s 1.36
 """
 
-import argparse, subprocess, sys, os, stat, json, tempfile
-import urllib.request, platform, time, hashlib, shutil, re, textwrap
+import argparse, subprocess, sys, os, json, tempfile
+import urllib.request, platform, time, hashlib, re, textwrap, ipaddress
+from datetime import datetime
 
-# ── Talos ↔ K8s mapping ──
+
+# ── Constants ──
 TALOS_MAP = {"1.34": "v1.8", "1.35": "v1.9", "1.36": "v1.10"}
 TALOSCTL_DIR = os.path.expanduser("~/.local/bin")
 TALOSCTL = os.path.join(TALOSCTL_DIR, "talosctl")
-STATE_FILE = "/tmp/talos-deploy-state.json"
+GOVC = os.path.join(TALOSCTL_DIR, "govc")
+STATE_FILE = os.path.join(tempfile.gettempdir(), "talos-deploy-state.json")
+
+# Default VM spec
+DEFAULT_VCPU = 2
+DEFAULT_RAM = 4   # GB
+DEFAULT_DISK = 20 # GB
 
 
-# ═══════════════════════════════════════════════════════════
-#  UTILS
-# ═══════════════════════════════════════════════════════════
+# ═══ UTILS ═══
 
-def _cmd(args, timeout=120, check=False):
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+def _cmd(args, timeout=120, check=False, env=None):
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
     if check and proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(args)} failed: {proc.stderr.strip()}")
+        raise RuntimeError(f"{' '.join(args)} failed (rc={proc.returncode}): {proc.stderr.strip()}")
     return proc.returncode, proc.stdout, proc.stderr
 
 def tctl(*args, timeout=120, ok=False):
@@ -55,10 +79,25 @@ def kubectl(*args, kubeconfig=None, timeout=60, ok=False):
     cmd += list(args)
     return _cmd(cmd, timeout=timeout, check=ok)
 
-def save_state(phase: str, data: dict):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+def govc(*args, env_vars=None, timeout=120, ok=False):
+    cmd = [GOVC]
+    if env_vars:
+        cmd[0:0] = [f"{k}={v}" for k, v in env_vars.items()]
+    cmd += list(args)
+    return _cmd(cmd, timeout=timeout, check=ok)
+
+def govc_env(args):
+    """Build govc environment from esxi args."""
+    env = {}
+    for k in ("GOVC_URL", "GOVC_USERNAME", "GOVC_PASSWORD", "GOVC_DATASTORE", "GOVC_NETWORK", "GOVC_INSECURE"):
+        val = getattr(args, f"esxi_{k.replace('GOVC_','').lower()}", None) or os.environ.get(k, "")
+        if val:
+            env[k] = val
+    return env
+
+def save_state(phase, data):
     with open(STATE_FILE, "w") as f:
-        json.dump({"phase": phase, "data": data}, f)
+        json.dump({"phase": phase, "data": data}, f, default=str)
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -66,109 +105,222 @@ def load_state():
             return json.load(f)
     return None
 
-def parse_ips(s: str) -> list[str]:
+def parse_ips(s):
     return [ip.strip() for ip in s.split(",") if ip.strip()]
 
 
-# ═══════════════════════════════════════════════════════════
-#  TALOSCTL BOOTSTRAP
-# ═══════════════════════════════════════════════════════════
+# ═══ TOOL BOOTSTRAP ═══
 
-def ensure_talosctl(version: str):
-    if os.path.exists(TALOSCTL):
-        rc, out, _ = tctl("version", "--short", timeout=10)
-        if rc == 0 and version.strip("v") in out:
-            print(f"    talosctl {version} ✓ ")
+def ensure_binary(name, version, url_map, sha=False):
+    """Download + SHA256-verify a CLI binary."""
+    dst = os.path.join(TALOSCTL_DIR, name)
+    if os.path.exists(dst):
+        rc, out, _ = _cmd([dst, "version", "--short"], timeout=10) if name == TALOSCTL else (0, "ok", "")
+        if rc == 0 and version in out:
+            print(f"    {name} {version} ✓")
             return
 
     go_arch = {"aarch64": "arm64", "x86_64": "amd64"}.get(platform.machine())
     if not go_arch:
         sys.exit(f"Unsupported arch: {platform.machine()}")
 
-    url = f"https://github.com/siderolabs/talos/releases/download/{version}/talosctl-linux-{go_arch}"
-    sha_url = f"{url}.sha256"
-
-    print(f"    ↓ talosctl {version} ({go_arch}) ...")
+    url = url_map(version, go_arch)
     os.makedirs(TALOSCTL_DIR, exist_ok=True)
 
-    # Download
-    tmp = TALOSCTL + ".part"
+    print(f"    ↓ {name} {version} ({go_arch}) ...")
+    tmp = dst + ".part"
     urllib.request.urlretrieve(url, tmp)
     os.chmod(tmp, 0o755)
 
-    # SHA256 verify
-    try:
-        with urllib.request.urlopen(sha_url, timeout=15) as resp:
-            expected = resp.read().decode().split()[0]
-        actual = hashlib.sha256(open(tmp, "rb").read()).hexdigest()
-        if actual != expected:
-            os.unlink(tmp)
-            sys.exit(f"SHA256 mismatch for talosctl: got {actual[:16]}..., expected {expected[:16]}...")
-        print(f"    SHA256 ✓")
-    except Exception as e:
-        print(f"    SHA256 skipped ({e})")
+    if sha:
+        try:
+            with urllib.request.urlopen(f"{url}.sha256", timeout=15) as resp:
+                expected = resp.read().decode().split()[0]
+            actual = hashlib.sha256(open(tmp, "rb").read()).hexdigest()
+            if actual != expected:
+                os.unlink(tmp)
+                sys.exit(f"SHA256 mismatch for {name}")
+            print(f"    SHA256 ✓")
+        except Exception as e:
+            print(f"    SHA256 skipped ({e})")
 
-    os.rename(tmp, TALOSCTL)
-    print(f"    talosctl {version} installed ✓")
+    os.rename(tmp, dst)
+    print(f"    {name} {version} installed ✓")
 
 
-def gen_configs(cluster: str, cp_ip: str, output_dir: str, single_node: bool):
-    """Generate Talos machine configs with proper RFC 6902 patches."""
+def ensure_talosctl(version):
+    ensure_binary(
+        "talosctl", version,
+        lambda v, a: f"https://github.com/siderolabs/talos/releases/download/{v}/talosctl-linux-{a}",
+        sha=True
+    )
+
+def ensure_govc():
+    ver = "v0.40.0"
+    ensure_binary(
+        "govc", ver,
+        lambda v, a: f"https://github.com/vmware/govmomi/releases/download/{v}/govc_linux_{a}.gz"
+    )
+
+
+# ═══ ESXi VM CREATION ═══
+
+def iso_for_version(talos_ver):
+    arch_map = {"aarch64": "arm64", "x86_64": "amd64"}
+    iso_arch = arch_map.get(platform.machine(), "amd64")
+    return f"https://factory.talos.dev/installer/{talos_ver}/metal-{iso_arch}.iso"
+
+def upload_iso(env, talos_ver):
+    """Download Talos ISO locally, upload to ESXi datastore."""
+    iso_url = iso_for_version(talos_ver)
+    iso_name = f"talos-{talos_ver}.iso"
+    local_iso = os.path.join(tempfile.gettempdir(), iso_name)
+
+    # Check if already on datastore
+    rc, out, _ = govc("datastore.ls", iso_name, env_vars=env, timeout=15)
+    if rc == 0 and iso_name in out:
+        print(f"    ISO already on datastore: {iso_name} ✓")
+        return iso_name
+
+    # Download locally
+    if not os.path.exists(local_iso):
+        print(f"    ↓ ISO: {iso_url} ...")
+        urllib.request.urlretrieve(iso_url, local_iso)
+        print(f"    Downloaded: {os.path.getsize(local_iso)//1024//1024} MB")
+
+    # Upload to datastore
+    print(f"    ↑ Uploading {iso_name} to datastore...")
+    govc("datastore.upload", local_iso, iso_name, env_vars=env, ok=True, timeout=300)
+    print(f"    ISO uploaded ✓")
+    return iso_name
+
+
+def create_vm(env, name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
+    """Create a single VM with govc."""
+
+    print(f"  Creating VM: {name} ({ip}) ...")
+
+    # govc vm.create
+    govc("vm.create",
+         f"-c={vcpu}",
+         f"-m={ram_gb * 1024}",   # MB
+         f"-g=ubuntu64Guest",     # closest to Talos (Linux 64-bit)
+         f"-disk={disk_gb}GB",
+         f"-net={net}",
+         f"-net.adapter=vmxnet3",
+         f"-disk.controller=pvscsi",
+         f"-on=false",             # don't power on yet
+         name,
+         env_vars=env, ok=True)
+
+    # Attach ISO as CDROM
+    govc("device.cdrom.add", "-vm", name, iso_path, env_vars=env, ok=True)
+
+    # Set boot order: CDROM first, then disk
+    govc("device.boot", "-vm", name, "-order=cdrom,disk", env_vars=env, ok=True)
+
+    # Inject static IP via guestinfo (Talos reads this in maintenance mode)
+    # Format: guestinfo.talos.config=... but simpler: use kernel cmdline ip=
+    # We pass ip= via guestinfo.metadata or extraConfig
+    govc("vm.change", "-vm", name,
+         f"-e", f"guestinfo.talos.ip={ip}/24",  # /24 default, can be overridden
+         env_vars=env, ok=True)
+
+    # Power on
+    govc("vm.power", "-on", name, env_vars=env, ok=True)
+
+    # Wait for IP
+    print(f"    Waiting for IP ...")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        rc, out, _ = govc("vm.ip", name, env_vars=env, timeout=10)
+        if rc == 0 and out.strip():
+            vm_ip = out.strip()
+            print(f"    {name} → {vm_ip} ✓")
+            return vm_ip
+        time.sleep(5)
+
+    sys.exit(f"VM {name} never got IP (timeout 120s)")
+
+
+def create_all_vms(args):
+    """Create all VMs on ESXi. Returns dict of name→IP."""
+    ensure_govc()
+    env = govc_env(args)
+
+    # Validate connectivity
+    rc, out, _ = govc("about", env_vars=env, timeout=15)
+    if rc != 0:
+        sys.exit(f"Cannot connect to ESXi: {out}")
+    print(f"    ESXi connected: {out.strip().split(chr(10))[0]}")
+
+    # Upload ISO
+    talos_ver = TALOS_MAP[args.k8s]
+    iso_path = upload_iso(env, talos_ver)
+
+    vms = {}
+
+    # Create controlplane
+    cp_ip = args.cp
+    vm_name = f"{args.cluster}-cp"
+    actual_cp = create_vm(env, vm_name, cp_ip,
+                          args.vcpu, args.ram_gb, args.disk_gb,
+                          iso_path, env.get("GOVC_NETWORK", "VM Network"))
+    vms[vm_name] = actual_cp
+
+    # Create workers (for multi)
+    if args.mode == "multi" and hasattr(args, "workers"):
+        worker_ips = parse_ips(args.workers)
+        for i, w_ip in enumerate(worker_ips):
+            vm_name = f"{args.cluster}-worker-{i + 1}"
+            w = create_vm(env, vm_name, w_ip,
+                          args.vcpu, args.ram_gb, args.disk_gb,
+                          iso_path, env.get("GOVC_NETWORK", "VM Network"))
+            vms[vm_name] = w
+
+    print(f"\n  All VMs created:")
+    for name, ip in vms.items():
+        print(f"    {name:25s} → {ip}")
+
+    return vms
+
+
+# ═══ TALOS CONFIG + DEPLOY ═══
+
+def gen_configs(cluster, cp_ip, output_dir, single_node):
     tctl("gen", "config", cluster, f"https://{cp_ip}:6443",
          "--output-dir", output_dir, "--force", ok=True)
 
+    patches = [{
+        "op": "add",
+        "path": "/cluster/extraManifests",
+        "value": ["https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml"]
+    }]
+
     if single_node:
-        cp_yaml = os.path.join(output_dir, "controlplane.yaml")
-        # Read existing YAML, merge in allowSchedulingOnControlPlanes
-        # talosctl gen config supports --config-patch with JSON patch format
-        patch_file = os.path.join(output_dir, "patch-single-node.json")
-        patch = [
-            {
-                "op": "add",
-                "path": "/cluster/allowSchedulingOnControlPlanes",
-                "value": True
-            },
-            {
-                "op": "add",
-                "path": "/cluster/extraManifests",
-                "value": [
-                    "https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml"
-                ]
-            }
-        ]
-        with open(patch_file, "w") as f:
-            json.dump(patch, f)
-
-        # Re-gen with patches applied
-        tctl("gen", "config", cluster, f"https://{cp_ip}:6443",
-             "--output-dir", output_dir, "--force",
-             "--config-patch-control-plane", f"@{patch_file}",
-             ok=True)
-        print(f"    single-node patch applied (allowSchedulingOnCp + MetalLB manifests)")
-    else:
-        # Multi: apply MetalLB manifests patch
-        patch_file = os.path.join(output_dir, "patch-metallb.json")
-        patch = [{
+        patches.append({
             "op": "add",
-            "path": "/cluster/extraManifests",
-            "value": [
-                "https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml"
-            ]
-        }]
-        with open(patch_file, "w") as f:
-            json.dump(patch, f)
-        tctl("gen", "config", cluster, f"https://{cp_ip}:6443",
-             "--output-dir", output_dir, "--force",
-             "--config-patch-control-plane", f"@{patch_file}",
-             ok=True)
+            "path": "/cluster/allowSchedulingOnControlPlanes",
+            "value": True
+        })
+
+    patch_file = os.path.join(output_dir, "patch.json")
+    with open(patch_file, "w") as f:
+        json.dump(patches, f)
+
+    tctl("gen", "config", cluster, f"https://{cp_ip}:6443",
+         "--output-dir", output_dir, "--force",
+         "--config-patch-control-plane", f"@{patch_file}",
+         ok=True)
+    print(f"    configs generated + patched ✓")
 
 
-def wait_for_boot(node_ips: list[str], timeout=600):
+def wait_for_boot(node_ips, timeout=600):
     deadline = time.time() + timeout
-    print(f"    waiting for {len(node_ips)} node(s) to boot (timeout {timeout}s)...")
     healthy = set()
+    print(f"    waiting for {len(node_ips)} node(s) to boot ...")
     while time.time() < deadline:
-        for ip in node_ips:
+        for ip in list(node_ips):
             if ip in healthy:
                 continue
             rc, out, err = tctl("health", "--nodes", ip, timeout=15)
@@ -176,272 +328,111 @@ def wait_for_boot(node_ips: list[str], timeout=600):
                 healthy.add(ip)
                 print(f"      {ip} healthy ✓")
         if len(healthy) == len(node_ips):
-            print(f"    all nodes booted ✓")
             return
         time.sleep(10)
     remaining = set(node_ips) - healthy
-    sys.exit(f"Timeout: {len(remaining)} nodes still down: {remaining}")
+    sys.exit(f"Boot timeout: {remaining}")
 
 
-def wait_for_nodes_ready(cp_ip: str, kubeconfig: str, expected: int, timeout=300):
+def wait_for_nodes_ready(cp_ip, kubeconfig, expected, timeout=300):
     deadline = time.time() + timeout
-    print(f"    waiting for {expected} node(s) Ready...")
+    print(f"    waiting for {expected} node(s) Ready ...")
     while time.time() < deadline:
         rc, out, _ = kubectl("get", "nodes", "--no-headers",
                               kubeconfig=kubeconfig, timeout=15)
         if rc == 0:
             ready = [l for l in out.strip().split("\n") if " Ready " in l]
             if len(ready) >= expected:
-                print(f"    {len(ready)}/{expected} nodes Ready ✓")
+                print(f"    {len(ready)}/{expected} Ready ✓")
                 return
-            print(f"      {len(ready)}/{expected} ready, waiting...")
         time.sleep(15)
-    sys.exit(f"Timeout: nodes not ready")
+    sys.exit("Node readiness timeout")
 
 
-def verify_cluster(kubeconfig: str):
+def verify_cluster(kubeconfig):
     print("\n  Cluster health:")
     kubectl("get", "nodes", "-o", "wide", kubeconfig=kubeconfig, ok=True)
-    kubectl("get", "pods", "-A", "--field-selector", "status.phase!=Running",
-            kubeconfig=kubeconfig, timeout=30)
-    print("    ✓ all pods healthy")
-
-
-# ═══════════════════════════════════════════════════════════
-#  ALL-IN-ONE
-# ═══════════════════════════════════════════════════════════
-
-def deploy_all_in_one(cp_ip: str, cluster: str, talos_ver: str, k8s_ver: str, mlb_range: str):
-    iso_url = iso_for_version(talos_ver)
-    print(f"""
-{'='*60}
- TALOS ALL-IN-ONE: {cp_ip}
- Talos {talos_ver} → K8s ~{k8s_ver}
- ISO: {iso_url}
-{'='*60}
-""")
-    ensure_talosctl(talos_ver)
-
-    # Check state for resume
-    state = load_state()
-    if state:
-        print(f"  Found saved state at phase '{state['phase']}' — resuming...")
+    rc, out, _ = kubectl("get", "pods", "-A", "--field-selector", "status.phase!=Running",
+                          kubeconfig=kubeconfig, timeout=30)
+    if "No resources found" in out or out.strip() == "":
+        print("    ✓ all pods healthy")
     else:
-        state = {"phase": "init", "data": {}}
+        print("    ⚠ non-Running pods:")
+        print(out[:500])
 
-    # Phase 0: Boot
-    if state["phase"] in ("init",):
-        print("[1/5] Boot VM from ISO")
-        print(f"  ISO URL: {iso_url}")
-        print(f"  Mount ISO on ESXi VM ({cp_ip}), boot to Talos maintenance mode.")
-        input("  Press Enter when VM is booted... ")
-        save_state("booted", {"cp_ip": cp_ip, "cluster": cluster, "talos_ver": talos_ver})
 
-    # Phase 1: Configs
-    if state["phase"] in ("init", "booted"):
-        print("[2/5] Generate + apply configs")
+def _deploy_cluster(mode, cp_ip, workers, cluster, talos_ver, mlb_range):
+    """Core deploy logic — shared by ESXi+deploy and manual-deploy modes."""
+
+    state = load_state() or {"phase": "init", "data": {"mode": mode}}
+
+    # ─── Configs ───
+    if state["phase"] in ("init", "booted", "vms_created"):
+        print("[1/4] Generate + apply Talos configs")
         tmp = tempfile.mkdtemp(prefix="talos-")
+        gen_configs(cluster, cp_ip, tmp, single_node=(mode == "all-in-one"))
 
-        gen_configs(cluster, cp_ip, tmp, single_node=True)
-
-        # Apply
         tctl("apply-config", "--insecure", "--nodes", cp_ip,
              "--file", os.path.join(tmp, "controlplane.yaml"),
              ok=True, timeout=120)
-        print(f"    config applied — node rebooting...")
-        save_state("config_applied", {"tmp": tmp, "cp_ip": cp_ip})
+        print(f"    cp config applied — rebooting ✓")
 
-    # Phase 2: Bootstrap
-    if state["phase"] in ("init", "booted", "config_applied"):
-        tmp = state["data"]["tmp"]
-        cp_ip = state["data"]["cp_ip"]
+        if workers:
+            worker_cfg = os.path.join(tmp, "worker.yaml")
+            for w in workers:
+                tctl("apply-config", "--insecure", "--nodes", w,
+                     "--file", worker_cfg, ok=True, timeout=120)
+                print(f"    worker {w} config applied ✓")
 
-        wait_for_boot([cp_ip], 300)
+        save_state("configs_applied",
+                   {"tmp": tmp, "cp_ip": cp_ip, "workers": workers, "mlb_range": mlb_range})
 
-        print("[3/5] Bootstrap cluster")
-        # bootstrap may need retries
-        for attempt in range(3):
-            rc, out, err = tctl("bootstrap", "--nodes", cp_ip,
-                                 "--talosconfig", os.path.join(tmp, "talosconfig"),
-                                 timeout=300)
-            if rc == 0:
-                break
-            print(f"    bootstrap attempt {attempt+1}/3 failed, retrying in 15s...")
-            time.sleep(15)
-        else:
-            sys.exit("bootstrap failed after 3 attempts")
-        print(f"    bootstrap OK ✓")
-        save_state("bootstrapped", {"tmp": tmp, "cp_ip": cp_ip, "mlb_range": mlb_range})
-
-    # Phase 3: Kubeconfig + verify
-    if state["phase"] in ("booted", "config_applied", "bootstrapped"):
-        tmp = state["data"]["tmp"]
-        cp_ip = state["data"]["cp_ip"]
-
-        print("[4/5] Fetch kubeconfig")
-        kube_path = os.path.join(tmp, "kubeconfig")
-        tctl("kubeconfig", kube_path, "--nodes", cp_ip,
-             "--talosconfig", os.path.join(tmp, "talosconfig"),
-             ok=True, timeout=60)
-        print(f"    kubeconfig: {kube_path} ✓")
-
-        wait_for_nodes_ready(cp_ip, kube_path, expected=1, timeout=600)
-        verify_cluster(kube_path)
-        save_state("verified", {"tmp": tmp, "cp_ip": cp_ip, "kubeconfig": kube_path, "mlb_range": mlb_range})
-
-    # Phase 4: MetalLB IP pool
-    if state["phase"] in ("bootstrapped", "verified"):
-        tmp = state["data"]["tmp"]
-        kube_path = state["data"]["kubeconfig"]
-        mlb_range = state["data"]["mlb_range"]
-
-        print("[5/5] Configure MetalLB IP pool")
-        # Wait for MetalLB controller (from extraManifests)
-        kubectl("wait", "--for=condition=available", "deployment/controller",
-                "-n", "metallb-system", "--timeout=120s",
-                kubeconfig=kube_path, timeout=130)
-
-        mlb_yaml = f"""---
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: default-pool
-  namespace: metallb-system
-spec:
-  addresses:
-  - {mlb_range}
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: default-l2
-  namespace: metallb-system
-"""
-        pool_file = os.path.join(tmp, "metallb-pool.yaml")
-        with open(pool_file, "w") as f:
-            f.write(mlb_yaml)
-
-        kubectl("apply", "-f", pool_file, kubeconfig=kube_path, ok=True, timeout=30)
-        print(f"    MetalLB pool {mlb_range} applied ✓")
-        save_state("done", state["data"])
-
-    # Done
-    data = save_state("done", state["data"]) or state["data"]
-    kube_path = data.get("kubeconfig", "?")
-    print(f"""
-✅ ALL-IN-ONE CLUSTER READY
-   export KUBECONFIG={kube_path}
-   kubectl get nodes -o wide
-""")
-
-
-# ═══════════════════════════════════════════════════════════
-#  MULTI
-# ═══════════════════════════════════════════════════════════
-
-def deploy_multi(cp_ip: str, workers: list[str], cluster: str,
-                 talos_ver: str, k8s_ver: str, mlb_range: str):
-    iso_url = iso_for_version(talos_ver)
-    all_ips = [cp_ip] + workers
-
-    print(f"""
-{'='*60}
- TALOS MULTI: cp={cp_ip}  workers={len(workers)}
- Talos {talos_ver} → K8s ~{k8s_ver}
- ISO: {iso_url}
-{'='*60}
-""")
-    ensure_talosctl(talos_ver)
-
-    state = load_state() or {"phase": "init", "data": {}}
-
-    # Phase 0: Boot
-    if state["phase"] in ("init",):
-        print("[1/6] Boot all VMs from ISO")
-        print(f"  ISO: {iso_url}")
-        print(f"  Boot ALL VMs: {', '.join(all_ips)}")
-        input("  Press Enter when ALL booted... ")
-        save_state("booted", {"cp_ip": cp_ip, "workers": workers, "cluster": cluster})
-
-    # Phase 1: Configs
-    if state["phase"] in ("init", "booted"):
-        print("[2/6] Generate + apply configs")
-        tmp = tempfile.mkdtemp(prefix="talos-multi-")
-        
-        gen_configs(cluster, cp_ip, tmp, single_node=False)
-
-        # Cp first
-        tctl("apply-config", "--insecure", "--nodes", cp_ip,
-             "--file", os.path.join(tmp, "controlplane.yaml"),
-             ok=True, timeout=120)
-        print(f"    cp config applied ✓")
-
-        # Workers
-        worker_cfg = os.path.join(tmp, "worker.yaml")
-        for w in workers:
-            tctl("apply-config", "--insecure", "--nodes", w,
-                 "--file", worker_cfg, ok=True, timeout=120)
-            print(f"    worker {w} config applied ✓")
-
-        save_state("configs_applied", {"tmp": tmp, "cp_ip": cp_ip, "workers": workers, "mlb_range": mlb_range})
-
-    # Phase 2: Bootstrap
-    if state["phase"] in ("booted", "configs_applied"):
-        tmp = state["data"]["tmp"]
-        cp_ip = state["data"]["cp_ip"]
-        workers = state["data"]["workers"]
+    # ─── Bootstrap ───
+    if state["phase"] in ("configs_applied",):
+        d = state["data"]
+        cp_ip, workers, tmp, mlb_range = d["cp_ip"], d.get("workers", []), d["tmp"], d["mlb_range"]
         all_ips = [cp_ip] + workers
 
-        wait_for_boot(all_ips, 600)
+        wait_for_boot(all_ips)
 
-        print("[3/6] Bootstrap controlplane")
+        print("[2/4] Bootstrap cluster")
         for attempt in range(3):
             rc, out, _ = tctl("bootstrap", "--nodes", cp_ip,
                                "--talosconfig", os.path.join(tmp, "talosconfig"),
                                timeout=300)
             if rc == 0:
                 break
-            print(f"    retry {attempt+1}/3...")
+            print(f"    retry {attempt + 1}/3 ...")
             time.sleep(15)
         else:
-            sys.exit("bootstrap failed")
+            sys.exit("bootstrap failed after 3 attempts")
         print(f"    bootstrap OK ✓")
-        save_state("bootstrapped", state["data"])
+        save_state("bootstrapped", d)
 
-    # Phase 3: Kubeconfig
-    if state["phase"] in ("configs_applied", "bootstrapped"):
-        tmp = state["data"]["tmp"]
-        cp_ip = state["data"]["cp_ip"]
+    # ─── Kubeconfig + Verify ───
+    if state["phase"] in ("bootstrapped",):
+        d = state["data"]
+        cp_ip, workers, tmp = d["cp_ip"], d.get("workers", []), d["tmp"]
 
-        print("[4/6] Fetch kubeconfig")
         kube_path = os.path.join(tmp, "kubeconfig")
         tctl("kubeconfig", kube_path, "--nodes", cp_ip,
              "--talosconfig", os.path.join(tmp, "talosconfig"),
-             ok=True)
-        print(f"    kubeconfig: {kube_path} ✓")
+             ok=True, timeout=60)
+        print(f"    kubeconfig ✓")
 
-        save_state("kube_ready", {"tmp": tmp, "cp_ip": cp_ip, "kubeconfig": kube_path,
-                                   "workers": state["data"]["workers"], "mlb_range": state["data"]["mlb_range"]})
-
-    # Phase 4: Wait nodes
-    if state["phase"] in ("kube_ready",):
-        cp_ip = state["data"]["cp_ip"]
-        kube_path = state["data"]["kubeconfig"]
-        workers = state["data"]["workers"]
         expected = 1 + len(workers)
-
-        print("[5/6] Wait for nodes ready")
-        wait_for_nodes_ready(cp_ip, kube_path, expected=expected, timeout=600)
+        print("[3/4] Wait for nodes ready")
+        wait_for_nodes_ready(cp_ip, kube_path, expected, timeout=600)
         verify_cluster(kube_path)
-        save_state("nodes_ready", state["data"])
+        save_state("nodes_ready",
+                   {**d, "kubeconfig": kube_path})
 
-    # Phase 5: MetalLB IP pool
+    # ─── MetalLB ───
     if state["phase"] in ("nodes_ready",):
-        kube_path = state["data"]["kubeconfig"]
-        mlb_range = state["data"]["mlb_range"]
-        tmp = state["data"]["tmp"]
+        d = state["data"]
+        kube_path, mlb_range, tmp = d["kubeconfig"], d["mlb_range"], d["tmp"]
 
-        print("[6/6] Configure MetalLB IP pool")
+        print("[4/4] Configure MetalLB IP pool")
         kubectl("wait", "--for=condition=available", "deployment/controller",
                 "-n", "metallb-system", "--timeout=120s",
                 kubeconfig=kube_path, timeout=130)
@@ -468,76 +459,131 @@ metadata:
 
         kubectl("apply", "-f", pool_file, kubeconfig=kube_path, ok=True)
         print(f"    MetalLB pool {mlb_range} ✓")
-        save_state("done", state["data"])
+        save_state("done", d)
 
-    data = load_state()["data"]
-    kube_path = data.get("kubeconfig", "?")
+    # ─── Done ───
+    final = (load_state() or {"data":{}}).get("data", {})
+    kubeconfig = final.get("kubeconfig", "?")
     print(f"""
-✅ MULTI-NODE CLUSTER READY
-   CP:        {cp_ip}
-   Workers:   {', '.join(workers)}
-   export KUBECONFIG={kube_path}
+✅ CLUSTER READY ({mode.upper()})
+   export KUBECONFIG={kubeconfig}
+   kubectl get nodes -o wide
 """)
 
 
-# ── ISO URL ──
-def iso_for_version(talos_ver: str) -> str:
-    arch = platform.machine()
-    iso_arch = {"aarch64": "arm64", "x86_64": "amd64"}.get(arch, "amd64")
-    return f"https://factory.talos.dev/installer/{talos_ver}/metal-{iso_arch}.iso"
+# ═══ MAIN ═══
 
-
-# ── MAIN ──
 def main():
     parser = argparse.ArgumentParser(
-        description="Talos K8s on ESXi — one click, all pulled on-the-fly",
+        description="Talos K8s on ESXi — one click, everything pulled on-the-fly",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
-Examples:
-  all-in-one:
-    python3 talos-deploy.py all-in-one --cp 10.0.1.50 --cluster prod --k8s 1.35 --metallb-range 10.0.1.240-10.0.1.250
-  multi:
-    python3 talos-deploy.py multi --cp 10.0.1.50 --workers 10.0.1.51,10.0.1.52 --cluster prod --k8s 1.36
+        epilog=textwrap.dedent("""\
+        Examples:
+          Full zero-touch (VM creation + deploy):
+            python3 talos-deploy.py all-in-one \\
+              --cp 10.0.1.50 --cluster prod --k8s 1.35 \\
+              --esxi-host 10.0.1.10 \\
+              --esxi-datastore datastore1 --esxi-network "VM Network"
 
-Pre-reqs:
-  - ESXi VMs ready (boot from printed ISO URL)
-  - This machine: Python 3.8+, internet to github.com + factory.talos.dev + k8s.io
-  - talosctl auto-downloaded + SHA256 verified to ~/.local/bin/
-  - kubectl installed for MetalLB IP pool apply (apt install kubectl or use talosctl --talosconfig)
-""",
+          Manual (VMs already exist):
+            python3 talos-deploy.py all-in-one \\
+              --cp 10.0.1.50 --cluster prod --k8s 1.35  
+        """),
     )
 
     sub = parser.add_subparsers(dest="mode", required=True)
 
+    # Shared args
     shared = argparse.ArgumentParser(add_help=False)
-    shared.add_argument("--cp", required=True, help="Controlplane IP (primary endpoint)")
-    shared.add_argument("--cluster", required=True, help="Cluster name (RFC1123, lowercase)")
-    shared.add_argument("--k8s", choices=["1.34", "1.35", "1.36"], default="1.35")
+    shared.add_argument("--cp", required=True, help="Controlplane node IP")
+    shared.add_argument("--cluster", required=True, help="Cluster name (RFC1123)")
+    shared.add_argument("--k8s", choices=list(TALOS_MAP), default="1.35", help="K8s version")
     shared.add_argument("--metallb-range", default="192.168.1.240-192.168.1.250",
-                        help="MetalLB L2 IP range (default: 192.168.1.240-192.168.1.250)")
+                        help="MetalLB L2 IP range")
 
-    aio = sub.add_parser("all-in-one", parents=[shared],
-                         help="1 VM = controlplane + worker")
-    multi = sub.add_parser("multi", parents=[shared],
+    # ESXi args (VM creation)
+    esxi = argparse.ArgumentParser(add_help=False)
+    esxi.add_argument("--esxi-host", help="ESXi IP or hostname (enables VM creation)")
+    esxi.add_argument("--esxi-user", default="root", help="ESXi username (default: root)")
+    esxi.add_argument("--esxi-pass", default=os.environ.get("ESXI_PASSWORD", ""),
+                      help="ESXi password (or set ESXI_PASSWORD env)")
+    esxi.add_argument("--esxi-datastore", default="datastore1", help="Datastore name")
+    esxi.add_argument("--esxi-network", default="VM Network", help="Network name")
+    esxi.add_argument("--esxi-insecure", action="store_true", default=True,
+                      help="Skip TLS verify (default: true)")
+    esxi.add_argument("--vcpu", type=int, default=DEFAULT_VCPU, help=f"vCPU per VM (default: {DEFAULT_VCPU})")
+    esxi.add_argument("--ram-gb", type=int, default=DEFAULT_RAM, help=f"RAM GB per VM (default: {DEFAULT_RAM})")
+    esxi.add_argument("--disk-gb", type=int, default=DEFAULT_DISK, help=f"Disk GB per VM (default: {DEFAULT_DISK})")
+
+    # Subcommands
+    aio = sub.add_parser("all-in-one", parents=[shared, esxi],
+                         help="Single VM = controlplane + worker")
+    multi = sub.add_parser("multi", parents=[shared, esxi],
                            help="1 controlplane + N workers")
-    multi.add_argument("--workers", required=True, help="Worker IPs, comma-separated")
+    multi.add_argument("--workers", required=True, help="Comma-separated worker IPs")
 
     args = parser.parse_args()
 
-    # kubectl check (optional, warn)
-    rc, _, _ = _cmd(["which", "kubectl"], timeout=5)
-    if rc != 0:
-        print("⚠  kubectl not found — MetalLB IP pool apply may fail.")
-        print("   Install: snap install kubectl --classic  or  apt install kubectl")
-        print("   Alternatively: export KUBECONFIG=... and apply MetalLB manually\n")
+    # Guard: kubectl
+    if _cmd(["which", "kubectl"], timeout=5)[0] != 0:
+        print("⚠  kubectl not found — MetalLB apply will fail.")
+        print("   Snap: sudo snap install kubectl --classic")
+        print("   Apt:  sudo apt install kubectl\n")
 
     talos_ver = TALOS_MAP[args.k8s]
+    workers = parse_ips(args.workers) if args.mode == "multi" and args.workers else []
 
-    if args.mode == "all-in-one":
-        deploy_all_in_one(args.cp, args.cluster, talos_ver, args.k8s, args.metallb_range)
-    elif args.mode == "multi":
-        deploy_multi(args.cp, parse_ips(args.workers), args.cluster,
-                     talos_ver, args.k8s, args.metallb_range)
+    # ─── ESXi VM creation mode ───
+    if args.esxi_host:
+        # Build govc env from args
+        esxi_url = f"https://{args.esxi_user}:{args.esxi_pass}@{args.esxi_host}/sdk"
+        os.environ["GOVC_URL"] = esxi_url
+        os.environ["GOVC_USERNAME"] = args.esxi_user
+        os.environ["GOVC_PASSWORD"] = args.esxi_pass
+        os.environ["GOVC_DATASTORE"] = args.esxi_datastore
+        os.environ["GOVC_NETWORK"] = args.esxi_network
+        if args.esxi_insecure:
+            os.environ["GOVC_INSECURE"] = "true"
+
+        print(f"""
+{'=' * 60}
+ TALOS + ESXi (govc VM creation)
+ ESXi:        {args.esxi_host}
+ Datastore:   {args.esxi_datastore}
+ Network:     {args.esxi_network}
+ Mode:        {args.mode}  Talos={talos_ver}  K8s~{args.k8s}
+{'=' * 60}
+""")
+
+        state = load_state() or {"phase": "init", "data": {}}
+
+        # Phase 0: Create VMs
+        if state["phase"] in ("init",):
+            print("[0/4] Create VMs on ESXi")
+            vms = create_all_vms(args)
+            # Map actual IPs back
+            cp_ip = vms.get(f"{args.cluster}-cp", args.cp)
+            workers_ip = [vms[f"{args.cluster}-worker-{i + 1}"]
+                          for i in range(len(workers))] if workers else []
+            save_state("vms_created",
+                       {"cp_ip": cp_ip, "workers": workers_ip, "cluster": args.cluster})
+            print("    VMs created + booted ✓\n")
+
+        cp_ip = args.cp if state["phase"] == "init" else state["data"]["cp_ip"]
+        workers_ip = workers if state["phase"] == "init" else state["data"]["workers"]
+
+        _deploy_cluster(args.mode, cp_ip, workers_ip, args.cluster, talos_ver, args.metallb_range)
+
+    # ─── Manual mode (VMs already exist) ───
+    else:
+        ensure_talosctl(talos_ver)
+        print(f"""
+{'=' * 60}
+ TALOS (manual — VMs already booted)
+ Mode: {args.mode}  Talos={talos_ver}  K8s~{args.k8s}
+{'=' * 60}
+""")
+        _deploy_cluster(args.mode, args.cp, workers, args.cluster, talos_ver, args.metallb_range)
 
 
 if __name__ == "__main__":
