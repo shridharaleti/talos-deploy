@@ -72,7 +72,12 @@ def _cmd(args, timeout=120, check=False, env=None):
     cmd_str = ' '.join(str(a) for a in args)
     if DEBUG:
         print(f"[DEBUG] Running: {cmd_str}")
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        if DEBUG:
+            print(f"[DEBUG] Command timed out after {timeout}s: {cmd_str}")
+        return 124, "", f"Command timed out after {timeout}s"
     if DEBUG:
         print(f"[DEBUG] stdout: {proc.stdout[:500]}{'...' if len(proc.stdout) > 500 else ''}")
         print(f"[DEBUG] stderr: {proc.stderr[:500]}{'...' if len(proc.stderr) > 500 else ''}")
@@ -229,19 +234,35 @@ def create_vm(name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
          f"-net={net}",
          f"-net.adapter=vmxnet3",
          f"-disk.controller=pvscsi",
+         f"-firmware=efi",        # ponytail: Talos ISO requires UEFI, BIOS boots to 'Operating System not found'
          f"-on=false", name, ok=True)
 
-    # Attach ISO as CDROM
-    govc("device.cdrom.add", "-vm", name, iso_path, ok=True)
+    # Attach ISO as CDROM: add device, then insert ISO
+    govc("device.cdrom.add", "-vm", name, ok=True)
+    # Find the CDROM device name just created
+    rc, devs_out, _ = govc("device.ls", "-vm", name, timeout=10)
+    cdrom_dev = None
+    for line in devs_out.splitlines():
+        if "VirtualCdrom" in line:
+            cdrom_dev = line.split()[0]
+            break
+    if cdrom_dev:
+        govc("device.cdrom.insert", "-vm", name, "-device", cdrom_dev, iso_path, ok=True)
+    else:
+        print(f"    ⚠ CDROM device not found after add — ISO may not be attached")
 
     # Set boot order: CDROM first, then disk
     govc("device.boot", "-vm", name, "-order=cdrom,disk", ok=True)
 
-    # Inject static IP via guestinfo (Talos reads this in maintenance mode)
-    # Format: guestinfo.talos.config=... but simpler: use kernel cmdline ip=
-    # We pass ip= via guestinfo.metadata or extraConfig
+    # ponytail: inject static IP via guestinfo — Talos reads this in maintenance mode
     govc("vm.change", "-vm", name,
          f"-e", f"guestinfo.talos.ip={ip}/24", ok=True)
+
+    # Verify ISO attached
+    rc, out, _ = govc("device.ls", "-vm", name, timeout=10)
+    if iso_path.split("/")[-1] not in out:
+        print(f"    ⚠ ISO {iso_path} not attached — VM will show 'Operating System not found'")
+        print(f"    Attached devices: {out.strip() or '(none)'}")
 
     # Power on
     govc("vm.power", "-on", name, ok=True)
@@ -250,7 +271,7 @@ def create_vm(name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
     print(f"    Waiting for IP ...")
     deadline = time.time() + 120
     while time.time() < deadline:
-        rc, out, _ = govc("vm.ip", name, timeout=10)
+        rc, out, _ = govc("vm.ip", name, timeout=15)  # ponytail: first boot + DHCP + Talos init can take 60-90s
         if rc == 0 and out.strip():
             vm_ip = out.strip()
             print(f"    {name} → {vm_ip} ✓")
@@ -379,6 +400,7 @@ def verify_cluster(kubeconfig):
 
 def _deploy_cluster(mode, cp_ip, workers, cluster, talos_ver, mlb_range):
     """Core deploy logic — shared by ESXi+deploy and manual-deploy modes."""
+    d = None  # populated by each phase's unpacking, used at Done for kubeconfig path
 
     state = load_state() or {"phase": "init", "data": {"mode": mode}}
 
@@ -486,8 +508,10 @@ metadata:
         save_state("done", d)
 
     # ─── Done ───
-    # ponytail: d already in scope — avoids disk roundtrip via load_state()
-    kubeconfig = (d or {}).get("kubeconfig", "?")
+    # ponytail: d from last active phase — avoids disk roundtrip via load_state()
+    if d is None:
+        d = (load_state() or {}).get("data", {})
+    kubeconfig = d.get("kubeconfig", "?")
     print(f"""
 ✅ CLUSTER READY ({mode.upper()})
    export KUBECONFIG={kubeconfig}
@@ -569,6 +593,8 @@ def main():
 
     # ─── ESXi VM creation mode ───
     if args.esxi_host:
+        # Download talosctl if needed (govc already handled by ensure_govc)
+        ensure_talosctl(talos_ver)
         # Build govc env from args
         esxi_url = f"https://{args.esxi_user}:{args.esxi_pass}@{args.esxi_host}/sdk"
         if DEBUG:
@@ -618,7 +644,7 @@ def main():
             print("    VMs created + booted ✓\n")
 
         cp_ip = args.cp if state["phase"] == "init" else state["data"]["cp_ip"]
-        workers_ip = workers if state["phase"] == "init" else state["data"]["workers"]
+        workers_ip = workers if state["phase"] == "init" else state["data"].get("workers", [])
 
         _deploy_cluster(args.mode, cp_ip, workers_ip, args.cluster, talos_ver, args.metallb_range)
 
