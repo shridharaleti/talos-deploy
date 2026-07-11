@@ -131,41 +131,47 @@ def ensure_binary(name, version, url_map, sha=False):  # ponytail: govoc has no 
     print(f"    {name} {version} installed ✓")
 
 
-def _resolve_tag(minor_ver):  # ponytail: one HTTP call, GitHub API sort is stable enough
-    """Fetch latest stable patch tag for a minor version (e.g. v1.9 → v1.9.7)."""
-    major_minor = minor_ver.lstrip("v")
-    url = "https://api.github.com/repos/siderolabs/talos/releases?per_page=30"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        releases = json.loads(resp.read().decode())
-    for r in releases:
-        tag = r["tag_name"]
-        if tag.startswith(f"v{major_minor}") and "-" not in tag:
-            return tag
-    sys.exit(f"No stable Talos release for {minor_ver}")
 
 def ensure_talosctl(version):
-    tag = _resolve_tag(version)
+    """Download talosctl. version = exact tag (e.g. v1.9.0)."""
     ensure_binary(
-        "talosctl", tag,
+        "talosctl", version,
         lambda v, a: f"https://github.com/siderolabs/talos/releases/download/{v}/talosctl-linux-{a}",
-        sha=True
+        sha=False  # ponytail: no .sha256 sidecar in Talos releases
     )
 
+def govc_arch():
+    """Map platform.machine() to govc asset arch suffix."""
+    m = platform.machine()
+    return {"aarch64": "arm64"}.get(m, m)  # ponytail: x86_64→x86_64 pass-through, only aarch64 needs mapping
+
 def ensure_govc():
+    """Download + extract govc from .tar.gz (no --version flag, custom logic)."""
+    import tarfile
+    dst = os.path.join(TALOSCTL_DIR, "govc")
+    if os.path.exists(dst):
+        print("    govc v0.40.0 ✓")
+        return
     ver = "v0.40.0"
-    ensure_binary(
-        "govc", ver,
-        lambda v, a: f"https://github.com/vmware/govmomi/releases/download/{v}/govc_linux_{a}.gz"
-    )
+    arch = govc_arch()
+    url = f"https://github.com/vmware/govmomi/releases/download/{ver}/govc_Linux_{arch}.tar.gz"
+    os.makedirs(TALOSCTL_DIR, exist_ok=True)
+    print(f"    ↓ govc {ver} ({arch}) ...")
+    tmp = dst + ".tar.gz"
+    urllib.request.urlretrieve(url, tmp)
+    with tarfile.open(tmp, "r:gz") as tf:
+        tf.extract("govc", TALOSCTL_DIR)
+    os.chmod(dst, 0o755)
+    os.unlink(tmp)
+    print(f"    govc {ver} installed ✓")
 
 
 # ═══ ESXi VM CREATION ═══
 
 def iso_for_version(talos_ver):
-    arch_map = {"aarch64": "arm64", "x86_64": "amd64"}
+    arch_map = {"aarch64": "arm64", "x86_64": "amd64"}  # ponytail: extend if 386/s390x needed
     iso_arch = arch_map.get(platform.machine(), "amd64")
-    return f"https://factory.talos.dev/installer/{talos_ver}/metal-{iso_arch}.iso"
+    return f"https://github.com/siderolabs/talos/releases/download/{talos_ver}/metal-{iso_arch}.iso"
 
 def upload_iso(talos_ver):
     """Download Talos ISO locally, upload to ESXi datastore."""
