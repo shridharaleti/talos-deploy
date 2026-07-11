@@ -225,15 +225,12 @@ def create_vm(name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
 
     print(f"  Creating VM: {name} ({ip}) ...")
 
-    # Safety: check if VM already exists
-    rc, out, _ = govc("vm.info", name, timeout=10)
+    # Safety: vm.ip is the only reliable govc command that returns rc=1 for nonexistent VMs
+    # vm.info/find/ls all return rc=0 on misses — govc quirks
+    rc, out, _ = govc("vm.ip", name, timeout=10)
     if rc == 0:
-        print(f"    ⚠ VM '{name}' already exists — skipping creation (delete manually if replacement needed)")
-        # Still try to return IP for existing VM
-        rc2, ip_out, _ = govc("vm.ip", name, timeout=15)
-        if rc2 == 0 and ip_out.strip():
-            return ip_out.strip()
-        sys.exit(f"VM {name} exists but has no IP — check ESXi console")
+        print(f"    ⚠ VM '{name}' already exists (IP: {out.strip() or 'unknown'}) — skipping creation (delete manually if replacement needed)")
+        return out.strip() if out.strip() else name  # ponytail: fallback to name if IP empty, deploy handles it
 
     # ponytail: Talos on ESXi needs BIOS firmware — UEFI GRUB can't load kernel from
     # virtual CD-ROM on ESXi, gives "error: cannot load image". Upgrade path: Image Factory
