@@ -44,21 +44,16 @@ Usage:
 """
 
 import argparse, subprocess, sys, os, json, tempfile
-import urllib.request, platform, time, hashlib, re, textwrap, ipaddress
-from datetime import datetime
+import urllib.request, platform, time, hashlib, textwrap
 
 
 # ── Constants ──
-TALOS_MAP = {"1.34": "v1.8", "1.35": "v1.9", "1.36": "v1.10"}
+TALOS_MAP = {"1.34": "v1.8.0", "1.35": "v1.9.0", "1.36": "v1.10.0"}  # ponytail: hardcoded stable tags — GitHub API auto-resolution when patches diverge
 TALOSCTL_DIR = os.path.expanduser("~/.local/bin")
 TALOSCTL = os.path.join(TALOSCTL_DIR, "talosctl")
 GOVC = os.path.join(TALOSCTL_DIR, "govc")
 STATE_FILE = os.path.join(tempfile.gettempdir(), "talos-deploy-state.json")
 
-# Default VM spec
-DEFAULT_VCPU = 2
-DEFAULT_RAM = 4   # GB
-DEFAULT_DISK = 20 # GB
 
 
 # ═══ UTILS ═══
@@ -79,21 +74,9 @@ def kubectl(*args, kubeconfig=None, timeout=60, ok=False):
     cmd += list(args)
     return _cmd(cmd, timeout=timeout, check=ok)
 
-def govc(*args, env_vars=None, timeout=120, ok=False):
-    cmd = [GOVC]
-    if env_vars:
-        cmd[0:0] = [f"{k}={v}" for k, v in env_vars.items()]
-    cmd += list(args)
+def govc(*args, timeout=120, ok=False):
+    cmd = [GOVC] + list(args)
     return _cmd(cmd, timeout=timeout, check=ok)
-
-def govc_env(args):
-    """Build govc environment from esxi args."""
-    env = {}
-    for k in ("GOVC_URL", "GOVC_USERNAME", "GOVC_PASSWORD", "GOVC_DATASTORE", "GOVC_NETWORK", "GOVC_INSECURE"):
-        val = getattr(args, f"esxi_{k.replace('GOVC_','').lower()}", None) or os.environ.get(k, "")
-        if val:
-            env[k] = val
-    return env
 
 def save_state(phase, data):
     with open(STATE_FILE, "w") as f:
@@ -105,13 +88,13 @@ def load_state():
             return json.load(f)
     return None
 
-def parse_ips(s):
+def parse_ips(s):  # ponytail: one-liner, no need for a function — but called 3×, keeps call sites readable
     return [ip.strip() for ip in s.split(",") if ip.strip()]
 
 
 # ═══ TOOL BOOTSTRAP ═══
 
-def ensure_binary(name, version, url_map, sha=False):
+def ensure_binary(name, version, url_map, sha=False):  # ponytail: govoc has no --version, skips check by design
     """Download + SHA256-verify a CLI binary."""
     dst = os.path.join(TALOSCTL_DIR, name)
     if os.path.exists(dst):
@@ -148,9 +131,23 @@ def ensure_binary(name, version, url_map, sha=False):
     print(f"    {name} {version} installed ✓")
 
 
+def _resolve_tag(minor_ver):  # ponytail: one HTTP call, GitHub API sort is stable enough
+    """Fetch latest stable patch tag for a minor version (e.g. v1.9 → v1.9.7)."""
+    major_minor = minor_ver.lstrip("v")
+    url = "https://api.github.com/repos/siderolabs/talos/releases?per_page=30"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        releases = json.loads(resp.read().decode())
+    for r in releases:
+        tag = r["tag_name"]
+        if tag.startswith(f"v{major_minor}") and "-" not in tag:
+            return tag
+    sys.exit(f"No stable Talos release for {minor_ver}")
+
 def ensure_talosctl(version):
+    tag = _resolve_tag(version)
     ensure_binary(
-        "talosctl", version,
+        "talosctl", tag,
         lambda v, a: f"https://github.com/siderolabs/talos/releases/download/{v}/talosctl-linux-{a}",
         sha=True
     )
@@ -170,14 +167,14 @@ def iso_for_version(talos_ver):
     iso_arch = arch_map.get(platform.machine(), "amd64")
     return f"https://factory.talos.dev/installer/{talos_ver}/metal-{iso_arch}.iso"
 
-def upload_iso(env, talos_ver):
+def upload_iso(talos_ver):
     """Download Talos ISO locally, upload to ESXi datastore."""
     iso_url = iso_for_version(talos_ver)
     iso_name = f"talos-{talos_ver}.iso"
     local_iso = os.path.join(tempfile.gettempdir(), iso_name)
 
     # Check if already on datastore
-    rc, out, _ = govc("datastore.ls", iso_name, env_vars=env, timeout=15)
+    rc, out, _ = govc("datastore.ls", iso_name, timeout=15)
     if rc == 0 and iso_name in out:
         print(f"    ISO already on datastore: {iso_name} ✓")
         return iso_name
@@ -190,12 +187,12 @@ def upload_iso(env, talos_ver):
 
     # Upload to datastore
     print(f"    ↑ Uploading {iso_name} to datastore...")
-    govc("datastore.upload", local_iso, iso_name, env_vars=env, ok=True, timeout=300)
+    govc("datastore.upload", local_iso, iso_name, ok=True, timeout=300)
     print(f"    ISO uploaded ✓")
     return iso_name
 
 
-def create_vm(env, name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
+def create_vm(name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
     """Create a single VM with govc."""
 
     print(f"  Creating VM: {name} ({ip}) ...")
@@ -209,31 +206,28 @@ def create_vm(env, name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
          f"-net={net}",
          f"-net.adapter=vmxnet3",
          f"-disk.controller=pvscsi",
-         f"-on=false",             # don't power on yet
-         name,
-         env_vars=env, ok=True)
+         f"-on=false", name, ok=True)
 
     # Attach ISO as CDROM
-    govc("device.cdrom.add", "-vm", name, iso_path, env_vars=env, ok=True)
+    govc("device.cdrom.add", "-vm", name, iso_path, ok=True)
 
     # Set boot order: CDROM first, then disk
-    govc("device.boot", "-vm", name, "-order=cdrom,disk", env_vars=env, ok=True)
+    govc("device.boot", "-vm", name, "-order=cdrom,disk", ok=True)
 
     # Inject static IP via guestinfo (Talos reads this in maintenance mode)
     # Format: guestinfo.talos.config=... but simpler: use kernel cmdline ip=
     # We pass ip= via guestinfo.metadata or extraConfig
     govc("vm.change", "-vm", name,
-         f"-e", f"guestinfo.talos.ip={ip}/24",  # /24 default, can be overridden
-         env_vars=env, ok=True)
+         f"-e", f"guestinfo.talos.ip={ip}/24", ok=True)
 
     # Power on
-    govc("vm.power", "-on", name, env_vars=env, ok=True)
+    govc("vm.power", "-on", name, ok=True)
 
     # Wait for IP
     print(f"    Waiting for IP ...")
     deadline = time.time() + 120
     while time.time() < deadline:
-        rc, out, _ = govc("vm.ip", name, env_vars=env, timeout=10)
+        rc, out, _ = govc("vm.ip", name, timeout=10)
         if rc == 0 and out.strip():
             vm_ip = out.strip()
             print(f"    {name} → {vm_ip} ✓")
@@ -246,26 +240,25 @@ def create_vm(env, name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
 def create_all_vms(args):
     """Create all VMs on ESXi. Returns dict of name→IP."""
     ensure_govc()
-    env = govc_env(args)
 
     # Validate connectivity
-    rc, out, _ = govc("about", env_vars=env, timeout=15)
+    rc, out, _ = govc("about", timeout=15)
     if rc != 0:
         sys.exit(f"Cannot connect to ESXi: {out}")
     print(f"    ESXi connected: {out.strip().split(chr(10))[0]}")
 
     # Upload ISO
     talos_ver = TALOS_MAP[args.k8s]
-    iso_path = upload_iso(env, talos_ver)
+    iso_path = upload_iso(talos_ver)
 
     vms = {}
 
     # Create controlplane
     cp_ip = args.cp
     vm_name = f"{args.cluster}-cp"
-    actual_cp = create_vm(env, vm_name, cp_ip,
+    actual_cp = create_vm(vm_name, cp_ip,
                           args.vcpu, args.ram_gb, args.disk_gb,
-                          iso_path, env.get("GOVC_NETWORK", "VM Network"))
+                          iso_path, args.esxi_network)
     vms[vm_name] = actual_cp
 
     # Create workers (for multi)
@@ -273,9 +266,9 @@ def create_all_vms(args):
         worker_ips = parse_ips(args.workers)
         for i, w_ip in enumerate(worker_ips):
             vm_name = f"{args.cluster}-worker-{i + 1}"
-            w = create_vm(env, vm_name, w_ip,
+            w = create_vm(vm_name, w_ip,
                           args.vcpu, args.ram_gb, args.disk_gb,
-                          iso_path, env.get("GOVC_NETWORK", "VM Network"))
+                          iso_path, args.esxi_network)
             vms[vm_name] = w
 
     print(f"\n  All VMs created:")
@@ -462,8 +455,8 @@ metadata:
         save_state("done", d)
 
     # ─── Done ───
-    final = (load_state() or {"data":{}}).get("data", {})
-    kubeconfig = final.get("kubeconfig", "?")
+    # ponytail: d already in scope — avoids disk roundtrip via load_state()
+    kubeconfig = (d or {}).get("kubeconfig", "?")
     print(f"""
 ✅ CLUSTER READY ({mode.upper()})
    export KUBECONFIG={kubeconfig}
@@ -511,9 +504,9 @@ def main():
     esxi.add_argument("--esxi-network", default="VM Network", help="Network name")
     esxi.add_argument("--esxi-insecure", action="store_true", default=True,
                       help="Skip TLS verify (default: true)")
-    esxi.add_argument("--vcpu", type=int, default=DEFAULT_VCPU, help=f"vCPU per VM (default: {DEFAULT_VCPU})")
-    esxi.add_argument("--ram-gb", type=int, default=DEFAULT_RAM, help=f"RAM GB per VM (default: {DEFAULT_RAM})")
-    esxi.add_argument("--disk-gb", type=int, default=DEFAULT_DISK, help=f"Disk GB per VM (default: {DEFAULT_DISK})")
+    esxi.add_argument("--vcpu", type=int, default=2, help="vCPU per VM (default: 2)")
+    esxi.add_argument("--ram-gb", type=int, default=4, help="RAM GB per VM (default: 4)")
+    esxi.add_argument("--disk-gb", type=int, default=20, help="Disk GB per VM (default: 20)")
 
     # Subcommands
     aio = sub.add_parser("all-in-one", parents=[shared, esxi],
