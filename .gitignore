@@ -19,3 +19,6 @@ venv/
 Thumbs.db
 *.log
 /tmp/
+vm.sh
+*.env
+.env
