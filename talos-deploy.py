@@ -571,6 +571,10 @@ def main():
     if args.esxi_host:
         # Build govc env from args
         esxi_url = f"https://{args.esxi_user}:{args.esxi_pass}@{args.esxi_host}/sdk"
+        if DEBUG:
+            print(f"[DEBUG] GOVC_URL: https://{args.esxi_user}:***@{args.esxi_host}/sdk")
+            print(f"[DEBUG] GOVC_DATASTORE: {args.esxi_datastore}")
+            print(f"[DEBUG] GOVC_NETWORK: {args.esxi_network}")
         os.environ["GOVC_URL"] = esxi_url
         os.environ["GOVC_USERNAME"] = args.esxi_user
         os.environ["GOVC_PASSWORD"] = args.esxi_pass
@@ -578,6 +582,16 @@ def main():
         os.environ["GOVC_NETWORK"] = args.esxi_network
         if args.esxi_insecure:
             os.environ["GOVC_INSECURE"] = "true"
+
+        # Preflight: verify ESXi connectivity
+        if not os.path.exists(GOVC):
+            sys.exit("❌ govc not found. Run with --esxi-host to enable VM creation.")
+        print(f"    Checking ESXi connectivity: {args.esxi_host} ...")
+        rc, out, err = _cmd([GOVC, "about"], timeout=10)
+        if rc != 0:
+            print(f"[DEBUG] ESXi connection failed: {err.strip()}")
+            sys.exit(f"❌ Cannot connect to ESXi: {args.esxi_host}\n   Check credentials, network, and firewall.")
+        print(f"    ESXi connected: {out.strip().split(chr(10))[0]} ✓")
 
         print(f"""
 {'=' * 60}
