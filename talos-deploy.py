@@ -225,6 +225,20 @@ def create_vm(name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
 
     print(f"  Creating VM: {name} ({ip}) ...")
 
+    # Safety: check if VM already exists
+    rc, out, _ = govc("vm.info", name, timeout=10)
+    if rc == 0:
+        print(f"    ⚠ VM '{name}' already exists — skipping creation (delete manually if replacement needed)")
+        # Still try to return IP for existing VM
+        rc2, ip_out, _ = govc("vm.ip", name, timeout=15)
+        if rc2 == 0 and ip_out.strip():
+            return ip_out.strip()
+        sys.exit(f"VM {name} exists but has no IP — check ESXi console")
+
+    # ponytail: Talos on ESXi needs BIOS firmware — UEFI GRUB can't load kernel from
+    # virtual CD-ROM on ESXi, gives "error: cannot load image". Upgrade path: Image Factory
+    # UKI build if UEFI needed (Talos >= 1.12+).
+
     # govc vm.create
     govc("vm.create",
          f"-c={vcpu}",
@@ -234,7 +248,7 @@ def create_vm(name, ip, vcpu, ram_gb, disk_gb, iso_path, net):
          f"-net={net}",
          f"-net.adapter=vmxnet3",
          f"-disk.controller=pvscsi",
-         f"-firmware=efi",        # ponytail: Talos ISO requires UEFI, BIOS boots to 'Operating System not found'
+         f"-firmware=bios",       # ponytail: Talos on ESXi needs BIOS, not UEFI
          f"-on=false", name, ok=True)
 
     # Attach ISO as CDROM: add device, then insert ISO
