@@ -53,15 +53,32 @@ TALOSCTL_DIR = os.path.expanduser("~/.local/bin")
 TALOSCTL = os.path.join(TALOSCTL_DIR, "talosctl")
 GOVC = os.path.join(TALOSCTL_DIR, "govc")
 STATE_FILE = os.path.join(tempfile.gettempdir(), "talos-deploy-state.json")
+DEBUG = False  # ponytail: global flag, set by --debug
 
 
 
 # ═══ UTILS ═══
 
+def check_reachable(ip, port=50000):
+    """Check if Talos API port is reachable."""
+    import socket
+    try:
+        with socket.create_connection((ip, port), timeout=5):
+            return True
+    except:
+        return False
+
 def _cmd(args, timeout=120, check=False, env=None):
+    cmd_str = ' '.join(str(a) for a in args)
+    if DEBUG:
+        print(f"[DEBUG] Running: {cmd_str}")
     proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    if DEBUG:
+        print(f"[DEBUG] stdout: {proc.stdout[:500]}{'...' if len(proc.stdout) > 500 else ''}")
+        print(f"[DEBUG] stderr: {proc.stderr[:500]}{'...' if len(proc.stderr) > 500 else ''}")
+        print(f"[DEBUG] return code: {proc.returncode}")
     if check and proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(args)} failed (rc={proc.returncode}): {proc.stderr.strip()}")
+        raise RuntimeError(f"{cmd_str} failed (rc={proc.returncode}): {proc.stderr.strip()}")
     return proc.returncode, proc.stdout, proc.stderr
 
 def tctl(*args, timeout=120, ok=False):
@@ -371,6 +388,14 @@ def _deploy_cluster(mode, cp_ip, workers, cluster, talos_ver, mlb_range):
         tmp = tempfile.mkdtemp(prefix="talos-")
         gen_configs(cluster, cp_ip, tmp, single_node=(mode == "all-in-one"))
 
+        # Preflight: check Talos API reachability
+        if not check_reachable(cp_ip):
+            sys.exit(f"❌ Control plane {cp_ip}:50000 unreachable. Check VM status, network, and ESXi firewall.")
+        if workers:
+            for w in workers:
+                if not check_reachable(w):
+                    sys.exit(f"❌ Worker {w}:50000 unreachable. Check VM status, network, and ESXi firewall.")
+
         tctl("apply-config", "--insecure", "--nodes", cp_ip,
              "--file", os.path.join(tmp, "controlplane.yaml"),
              ok=True, timeout=120)
@@ -499,6 +524,7 @@ def main():
     shared.add_argument("--k8s", choices=list(TALOS_MAP), default="1.35", help="K8s version")
     shared.add_argument("--metallb-range", default="192.168.1.240-192.168.1.250",
                         help="MetalLB L2 IP range")
+    shared.add_argument("--debug", action="store_true", help="Enable verbose debug output")
 
     # ESXi args (VM creation)
     esxi = argparse.ArgumentParser(add_help=False)
@@ -522,6 +548,15 @@ def main():
     multi.add_argument("--workers", required=True, help="Comma-separated worker IPs")
 
     args = parser.parse_args()
+
+    # Set global debug flag
+    global DEBUG
+    DEBUG = args.debug
+    if DEBUG:
+        print(f"[DEBUG] Mode: {args.mode}")
+        print(f"[DEBUG] CP IP: {args.cp}")
+        print(f"[DEBUG] K8s: {args.k8s}")
+        print(f"[DEBUG] Talos version: {TALOS_MAP[args.k8s]}")
 
     # Guard: kubectl
     if _cmd(["which", "kubectl"], timeout=5)[0] != 0:
