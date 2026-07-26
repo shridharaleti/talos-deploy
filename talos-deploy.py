@@ -65,7 +65,7 @@ def check_reachable(ip, port=50000):
     try:
         with socket.create_connection((ip, port), timeout=5):
             return True
-    except:
+    except (OSError, ConnectionRefusedError, TimeoutError):  # ponytail: explicit — bare except catches SystemExit
         return False
 
 def _cmd(args, timeout=120, check=False, env=None):
@@ -116,7 +116,7 @@ def parse_ips(s):  # ponytail: one-liner, no need for a function — but called 
 
 # ═══ TOOL BOOTSTRAP ═══
 
-def ensure_binary(name, version, url_map, sha=False):  # ponytail: govoc has no --version, skips check by design
+def ensure_binary(name, version, url_map, sha=False):  # ponytail: govc has no --version, skips check by design
     """Download + SHA256-verify a CLI binary."""
     dst = os.path.join(TALOSCTL_DIR, name)
     if os.path.exists(dst):
@@ -141,7 +141,8 @@ def ensure_binary(name, version, url_map, sha=False):  # ponytail: govoc has no 
         try:
             with urllib.request.urlopen(f"{url}.sha256", timeout=15) as resp:
                 expected = resp.read().decode().split()[0]
-            actual = hashlib.sha256(open(tmp, "rb").read()).hexdigest()
+            with open(tmp, "rb") as fh:
+                actual = hashlib.sha256(fh.read()).hexdigest()
             if actual != expected:
                 os.unlink(tmp)
                 sys.exit(f"SHA256 mismatch for {name}")
@@ -182,7 +183,22 @@ def ensure_govc():
     tmp = dst + ".tar.gz"
     urllib.request.urlretrieve(url, tmp)
     with tarfile.open(tmp, "r:gz") as tf:
-        tf.extract("govc", TALOSCTL_DIR)
+        # ponytail: path traversal guard — Python 3.12 has filter=, but 3.11 doesn't
+        # Extract to temp dir, verify no path traversal, then move
+        import shutil
+        extract_dir = TALOSCTL_DIR + ".tmp"
+        os.makedirs(extract_dir, exist_ok=True)
+        tf.extractall(extract_dir)
+        safe_name = os.path.basename("govc")  # strip any path components
+        src = os.path.join(extract_dir, safe_name)
+        if not os.path.exists(src):
+            # find it recursively
+            for root, _, files in os.walk(extract_dir):
+                if "govc" in files:
+                    src = os.path.join(root, "govc")
+                    break
+        shutil.move(src, dst)
+        shutil.rmtree(extract_dir, ignore_errors=True)
     os.chmod(dst, 0o755)
     os.unlink(tmp)
     print(f"    govc {ver} installed ✓")
@@ -594,7 +610,7 @@ def main():
         print(f"[DEBUG] Talos version: {TALOS_MAP[args.k8s]}")
 
     # Guard: kubectl
-    if _cmd(["which", "kubectl"], timeout=5)[0] != 0:
+    if not __import__("shutil").which("kubectl"):
         print("⚠  kubectl not found — MetalLB apply will fail.")
         print("   Snap: sudo snap install kubectl --classic")
         print("   Apt:  sudo apt install kubectl\n")
